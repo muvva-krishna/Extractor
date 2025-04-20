@@ -7,7 +7,6 @@ from pdf2image.exceptions import (
 from pdfminer.high_level import extract_text
 import base64
 import io
-import os
 import concurrent.futures
 from tqdm import tqdm
 from openai import OpenAI
@@ -19,13 +18,20 @@ import numpy as np
 from rich import print
 from ast import literal_eval
 import os
-from dotenv import load_dotenv
 from asset import system_prompt
-
-
+import time
+from dotenv import load_dotenv
+from pinecone import Pinecone
+from langchain_openai import OpenAIEmbeddings
+from langchain_pinecone import PineconeVectorStore
+from langchain_core.output_parsers import StrOutputParser
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
+from pinecone import ServerlessSpec
+import uuid
 
 load_dotenv()
-api_key = os.getenv("OPENAI_API_KEY")
+api_key = ""
 client = OpenAI(api_key=api_key)
 
 
@@ -48,7 +54,7 @@ def get_img_uri(img):
 def analyze_image(data_uri):
     try:
         response = client.chat.completions.create(
-            model="gpt-4.1",
+            model="gpt-4.1-nano-2025-04-14",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {
@@ -89,27 +95,73 @@ def process_all_pdfs_in_folder(folder_path):
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             futures = [executor.submit(analyze_doc_image, img) for img in images]
+            ordered_results = []
             with tqdm(total=len(images), desc="Analyzing pages") as pbar:
-                results = []
-                for future in concurrent.futures.as_completed(futures):
+                for future in futures:
                     result = future.result()
-                    results.append(result)
+                    ordered_results.append(result)
                     pbar.update(1)
-
-            # Maintain original image order
-            ordered_results = [f.result() for f in futures]
             pdf_entry["chunks"].extend(ordered_results)
-
-        all_chunks.append(pdf_entry)
+            all_chunks.append(pdf_entry)
 
     return all_chunks
 
+
+pinecone_api_key = ""
+pc = Pinecone(api_key=pinecone_api_key)
+pcindex = pc.Index(name = "extractor",host="https://extractor-vd1mwjl.svc.aped-4627-b74a.pinecone.io")
+
+embeddings = OpenAIEmbeddings(api_key=api_key,model = "text-embedding-3-large")
+vectorstore = PineconeVectorStore(index= pcindex,embedding= embeddings)
+
+text_splitter = RecursiveCharacterTextSplitter()
+
+def create_embeddings(documents):
+    return embeddings.embed_documents([doc.page_content for doc in documents])
+
+def store_embeddings(documents, embeddings, batch_size=100):
+    pinecone_data = [
+        {
+            "id": f"{uuid.uuid4()}",
+            "values": embedding,
+            "metadata": {
+                "text": doc.page_content,
+                "pdf_name": doc.metadata["pdf_name"],
+                "chunk_number": doc.metadata["chunk_number"]
+            }
+        }
+        for doc, embedding in zip(documents, embeddings)
+    ]
+
+    for i in range(0, len(pinecone_data), batch_size):
+        batch = pinecone_data[i:i + batch_size]
+        res = pcindex.upsert(vectors=batch)
+        print(f"[green]Upserted batch of {len(batch)} vectors. Pinecone response: {res}[/green]")
+
+
+# Example usage in the main execution
 if __name__ == "__main__":
     folder_path = "./dataset"
-    result = process_all_pdfs_in_folder(folder_path)
-    for pdf in result:
-        print(f"\n[bold cyan]PDF: {pdf['pdf_name']}[/bold cyan]")
-        for idx, chunk in enumerate(pdf['chunks']):
-            print(f"\n[Page {idx + 1}]\n{chunk}\n")
+    labeled_chunks = process_all_pdfs_in_folder(folder_path)
 
+    chunk_documents = []
+    for pdf_entry in labeled_chunks:  # each PDF
+        pdf_name = pdf_entry["pdf_name"]
+        for i, chunk in enumerate(pdf_entry["chunks"]):
+            if not chunk or "error" in chunk.lower():  # Filter empty/error chunks
+                continue
+            doc = Document(
+                page_content=chunk,
+                metadata={"pdf_name": pdf_name, "chunk_number": i}
+            )
+            chunk_documents.append(doc)
+
+    print(f"[blue]Total valid chunks to embed: {len(chunk_documents)}[/blue]")
+
+
+    # Create and store embeddings
+    chunk_embeddings = create_embeddings(chunk_documents)
+    store_embeddings(chunk_documents, chunk_embeddings, batch_size=20)
+
+    print("[green]All documents stored in Pinecone with PDF metadata.[/green]")
 
