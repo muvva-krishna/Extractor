@@ -1,0 +1,9 @@
+python-dotenv
+pandas
+pdf2image
+pdfminer
+pdfminer.six
+openai
+scikit-learn
+rich
+tqdm
